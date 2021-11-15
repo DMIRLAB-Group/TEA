@@ -1,9 +1,13 @@
-# TEA
-##Requirements  
-python 3.6
-torch 1.9
+# TEA: A Sequential Recommendation Framework via Temporally Evolving Aggregations
+## Requirements  
+python 3.6  
+torch 1.9  
+numpy 1.19
 
-##Quick Start
+##  Compute environment
+GPU:V100
+
+## Quick Start  
 The experiment uses the Yelp and Epinions data sets. Data preprocessing is required before training.  Here uses yelp as an example
 ```
 python my_preprocess_yelp.py
@@ -15,4 +19,8 @@ python run_gatmeta_tea_gsage_yelp.py #TEA-S
 ```
 The training method of the baseline in the paper is similar  
 
-##Experiment Result
+## Experiment Result  
+### Epinions  
+![image](Epinions_res.png)  
+## #Yelp
+![image](Yelp_res.png)
