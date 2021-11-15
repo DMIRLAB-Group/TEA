@@ -95,57 +95,46 @@ class StepwiseLR:
 # Model
 
 
-class TransRec(nn.Module):
+class SocialMF(nn.Module):
     def __init__(self,
                  user_num,
                  item_num,
                  args):
-        super(TransRec, self).__init__()
+        super(SocialMF, self).__init__()
         self.user_num = user_num
         self.item_num = item_num
+        self.edim = args.edim
         self.dev = torch.device(args.device)
         self.args = args
 
+        # Embedding Layer
         self.user_embs = nn.Embedding(user_num, args.edim, padding_idx=0)
         self.item_embs = nn.Embedding(item_num, args.edim, padding_idx=0)
-        self.item_beta = nn.Embedding(item_num, 1, padding_idx=0)
-        self.trans = nn.Parameter(torch.zeros((args.edim, )))
+        nn.init.uniform_(self.user_embs.weight, a=-0.5/user_num, b=0.5/user_num)
+        nn.init.uniform_(self.item_embs.weight, a=-0.5/item_num, b=0.5/item_num)
 
-        nn.init.uniform_(self.user_embs.weight, a=-6 / args.edim, b=6 / args.edim)
-        nn.init.uniform_(self.item_embs.weight, a=-6 / args.edim, b=6 / args.edim)
-        nn.init.uniform_(self.item_beta.weight, a=-6 / args.edim, b=6 / args.edim)
-        nn.init.uniform_(self.trans.data, a=-6 / args.edim, b=6 / args.edim)
-
-    def l2_distance(self, x, y):
-        return (x - y).square().sum(dim=-1, keepdims=True)
-
-    def clip_by_norm(self, tensor, clip_norm, dim=None):
-        clip_norm = torch.FloatTensor([clip_norm]).to(tensor.device)
-        l2sum = tensor.pow(2).sum(dim=dim, keepdims=True)
-        pred = l2sum > 0
-        l2sum_safe = torch.where(pred, l2sum, torch.ones_like(l2sum))
-        l2norm = torch.where(pred, l2sum_safe.sqrt(), l2sum)
-        values_clip = tensor * clip_norm / torch.max(l2norm, clip_norm)
-        return values_clip
+    def pred(self, hu, hi):
+        return (hu * hi).sum(dim=-1)
 
     def forward(self, batch):
         uid, seq, pos, neg, nbr, nbr_iid = batch
+        uid = uid.unsqueeze(1).expand_as(seq)
+        hu = self.user_embs(uid.to(self.dev))
+        pos_hi = self.item_embs(pos.to(self.dev))
+        neg_hi = self.item_embs(neg.to(self.dev))
+        pos_logits = self.pred(hu, pos_hi)
+        neg_logits = self.pred(hu, neg_hi)
 
-        user_emb = self.clip_by_norm(self.user_embs(uid.to(self.dev)), clip_norm=1, dim=-1)  # B x d
-        seq_emb = self.clip_by_norm(self.item_embs(seq.to(self.dev)), clip_norm=1, dim=-1)  # B x sl x d
-        pos_emb = self.clip_by_norm(self.item_embs(pos.to(self.dev)), clip_norm=1, dim=-1)
-        neg_emb = self.clip_by_norm(self.item_embs(neg.to(self.dev)), clip_norm=1, dim=-1)
+        batch_size, nbr_maxlen = nbr.shape
+        nbr_mask = torch.BoolTensor(nbr == 0).to(self.dev)  # B x nl
+        nbr_len = (nbr_maxlen - nbr_mask.sum(1))  # B
+        nbr_emb = self.user_embs(nbr.to(self.dev))  # B x nl x d
+        nbr_emb *= ~nbr_mask.unsqueeze(-1)  # B x nl x d
+        nbr_len = nbr_len.view(batch_size, 1, 1)  # B x 1  x 1
+        nbr_emb = nbr_emb.sum(dim=1, keepdim=True) / nbr_len  # B x 1  x d
+        nbr_emb = nbr_emb.expand_as(hu)
 
-        user_emb = user_emb.unsqueeze(1).expand_as(seq_emb)  # B x sl x d
-        h_out = user_emb + self.trans + seq_emb
-
-        pos_bias = self.item_beta(pos.to(self.dev))  # B x sl x 1
-        neg_bias = self.item_beta(neg.to(self.dev))  # B x sl x 1
-
-        pos_logits = pos_bias - self.l2_distance(h_out, pos_emb)  # B x sl x 1
-        neg_logits = neg_bias - self.l2_distance(h_out, neg_emb)  # B x sl x 1
-
-        return pos_logits, neg_logits
+        return pos_logits, neg_logits, hu, pos_hi, neg_hi, nbr_emb
 
     def eval_all_users(self, eval_loader):
         all_scores = list()
@@ -153,14 +142,14 @@ class TransRec(nn.Module):
         with torch.no_grad():
             for i, eval_batch in enumerate(eval_loader):
                 uid, seq, nbr, nbr_iid, eval_iid = eval_batch
-                user_emb = self.user_embs(uid.long().to(self.dev))  # B x d
-                last_emb = self.item_embs(seq[:, -1].long().to(self.dev))  # B x d
-                item_embs = self.item_embs(eval_iid.long().to(self.dev))  # B x item_len x d
-                item_bias = self.item_beta(eval_iid.long().to(self.dev))  # B x item_len x 1
-                h_out = user_emb + self.trans + last_emb
-                h_out = h_out.unsqueeze(1).expand_as(item_embs)
-                batch_score = item_bias - self.l2_distance(h_out, item_embs)
-                all_scores.append(batch_score.squeeze())
+                uid = uid.long()
+                eval_iid = eval_iid.long()
+                hi = self.item_embs(eval_iid.to(self.dev))  # B x item_len x d
+                uid = uid.unsqueeze(1).expand_as(eval_iid)
+                user_emb = self.user_embs(uid.to(self.dev))
+                hu = user_emb
+                batch_score = self.pred(hu, hi)  # B x item_len
+                all_scores.append(batch_score)
 
             all_scores = torch.cat(all_scores, dim=0)
 
@@ -180,7 +169,8 @@ def parse_sampled_batch(batch):
     nbr_iid = nbr_iid.long()
     batch = [uid, seq, pos, neg, nbr, nbr_iid]
     indices = torch.where(pos != 0)
-    return batch, indices
+    seq_len = torch.BoolTensor(pos != 0).sum(dim=-1)
+    return batch, indices, seq_len
 
 
 def evaluate(model, eval_loader, eval_users):
@@ -219,13 +209,33 @@ def train(model, opt, shdlr, train_loader, args):
     model.train()
     total_loss = 0.0
     for batch in train_loader:
-        parsed_batch, indices = parse_sampled_batch(batch)
+        parsed_batch, indices, seq_len = parse_sampled_batch(batch)
+
         opt.zero_grad()
         shdlr.step()
-        pos_logits, neg_logits = model(parsed_batch)
-        loss = -1.0 * (pos_logits[indices] - neg_logits[indices]).sigmoid().log().mean()
+        pos_logits, neg_logits, user_emb, pos_hi, neg_hi, nbr_emb = model(parsed_batch)
+
+        # Label Loss
+        loss = 0.0
+        if args.loss_type == 'bce':
+            loss += F.binary_cross_entropy_with_logits(pos_logits[indices], torch.ones_like(pos_logits)[indices]) + \
+                    F.binary_cross_entropy_with_logits(neg_logits[indices], torch.zeros_like(neg_logits)[indices])
+        elif args.loss_type == 'bpr':
+            # loss += -1.0 * F.logsigmoid(pos_logits[indices] - neg_logits[indices]).mean()
+            loss += F.softplus(neg_logits[indices] - pos_logits[indices]).mean()
+
+        # Embedding Reg loss
+        user_norm = user_emb.norm(2).pow(2)
+        item_norm = pos_hi.norm(2).pow(2) + neg_hi.norm(2).pow(2)
+        emb_reg_loss = args.emb_reg * (user_norm + item_norm) / (2 * args.seq_maxlen * args.batch_size)
+        loss += emb_reg_loss
+
+        # Social Reg term
+        loss += args.alpha * F.mse_loss(user_emb, nbr_emb)
+
         loss.backward()
         opt.step()
+
         total_loss += loss.item()
 
     return total_loss / len(train_loader)
@@ -335,24 +345,28 @@ def load_ds(args, item_num):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='TransRec')
-    parser.add_argument('--model', default='TransRec')
+    parser = argparse.ArgumentParser(description='SocialMF')
+    parser.add_argument('--model', default='SocialMF')
     parser.add_argument('--dataset', default='Yelp')
 
     # Model Config
     parser.add_argument('--edim', type=int, default=64)
     parser.add_argument('--seq_maxlen', type=int, default=50, help='fixed, or change with sampled train_batches')
+    parser.add_argument('--nbr_maxlen', type=int, default=20, help='fixed, or change with sampled train_batches')
+    parser.add_argument('--alpha', type=float, default=1e-2, help='social reg term weight')
 
     # Train Config
     parser.add_argument('--batch_size', type=int, default=1024, help='fixed, or change with sampled train_batches')
-    parser.add_argument('--droprate', type=float, default=0.5)
+    parser.add_argument('--droprate', type=float, default=0.0)
     parser.add_argument('--lr', type=float, default=0.01)
-    parser.add_argument('--lr_gamma', type=float, default=0.001)
-    parser.add_argument('--lr_decay_rate', type=float, default=0.75)
-    parser.add_argument('--l2rg', type=float, default=0.0)
+    parser.add_argument('--lr_gamma', type=float, default=0.0)
+    parser.add_argument('--lr_decay_rate', type=float, default=0.0)
+    parser.add_argument('--l2rg', type=float, default=0)
+    parser.add_argument('--emb_reg', type=float, default=0.0)
     parser.add_argument('--device', default='cuda:1')
-    parser.add_argument('--max_epochs', type=int, default=200)
-    parser.add_argument('--check_epoch', type=int, default=5)
+    parser.add_argument('--max_epochs', type=int, default=50)
+    parser.add_argument('--check_epoch', type=int, default=1)
+    parser.add_argument('--loss_type', default='bce', help='bce/bpr')
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--patience', type=int, default=5)
 
@@ -369,7 +383,7 @@ def main():
     print('Loading...')
     st = time()
     train_loader, val_loader, test_loader, user_train, eval_users = load_ds(args, item_num)
-    print('Loaded Yelp dataset with {} users {} items in {:.2f}s'.format(user_num, item_num, time()-st))
+    print('Loaded Wechat dataset with {} users {} items in {:.2f}s'.format(user_num, item_num, time()-st))
 
     timestr = datetime.now().strftime("%Y%m%d_%Hh%Mm%Ss")
     model_path = f'saved_models/{args.model}_{args.dataset}_{timestr}.pth'
@@ -384,9 +398,9 @@ def main():
         torch.cuda.manual_seed_all(seed)
         np.random.seed(seed)
 
-        model = TransRec(user_num, item_num, args)
+        model = SocialMF(user_num, item_num, args)
         model = model.to(device)
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2rg)
         lr_scheduler = StepwiseLR(opt, init_lr=args.lr, gamma=args.lr_gamma, decay_rate=args.lr_decay_rate)
         best_score = patience_cnt = 0
 

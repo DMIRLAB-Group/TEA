@@ -95,55 +95,70 @@ class StepwiseLR:
 # Model
 
 
-class TransRec(nn.Module):
+class NeuMF(nn.Module):
     def __init__(self,
                  user_num,
                  item_num,
                  args):
-        super(TransRec, self).__init__()
-        self.user_num = user_num
-        self.item_num = item_num
+        super(NeuMF, self).__init__()
+        self.edim = args.edim
+        edim = args.edim
         self.dev = torch.device(args.device)
-        self.args = args
+        self.embedding_user_mlp = torch.nn.Embedding(user_num, edim, padding_idx=0)
+        self.embedding_item_mlp = torch.nn.Embedding(item_num, edim, padding_idx=0)
+        self.embedding_user_mf = torch.nn.Embedding(user_num, edim, padding_idx=0)
+        self.embedding_item_mf = torch.nn.Embedding(item_num, edim, padding_idx=0)
+        torch.nn.init.uniform_(self.embedding_user_mlp.weight, a=-0.5/user_num, b=0.5/user_num)
+        torch.nn.init.uniform_(self.embedding_item_mlp.weight, a=-0.5/item_num, b=0.5/item_num)
+        torch.nn.init.uniform_(self.embedding_user_mf.weight, a=-0.5/user_num, b=0.5/user_num)
+        torch.nn.init.uniform_(self.embedding_item_mf.weight, a=-0.5/item_num, b=0.5/item_num)
 
-        self.user_embs = nn.Embedding(user_num, args.edim, padding_idx=0)
-        self.item_embs = nn.Embedding(item_num, args.edim, padding_idx=0)
-        self.item_beta = nn.Embedding(item_num, 1, padding_idx=0)
-        self.trans = nn.Parameter(torch.zeros((args.edim, )))
+        self.mlp_lin0 = nn.Linear(edim + edim, edim)
+        self.mlp_lin1 = nn.Linear(edim, edim)
+        self.mlp_lin2 = nn.Linear(edim, edim)
+        self.out_lin = nn.Linear(edim + edim, 1)
 
-        nn.init.uniform_(self.user_embs.weight, a=-6 / args.edim, b=6 / args.edim)
-        nn.init.uniform_(self.item_embs.weight, a=-6 / args.edim, b=6 / args.edim)
-        nn.init.uniform_(self.item_beta.weight, a=-6 / args.edim, b=6 / args.edim)
-        nn.init.uniform_(self.trans.data, a=-6 / args.edim, b=6 / args.edim)
-
-    def l2_distance(self, x, y):
-        return (x - y).square().sum(dim=-1, keepdims=True)
-
-    def clip_by_norm(self, tensor, clip_norm, dim=None):
-        clip_norm = torch.FloatTensor([clip_norm]).to(tensor.device)
-        l2sum = tensor.pow(2).sum(dim=dim, keepdims=True)
-        pred = l2sum > 0
-        l2sum_safe = torch.where(pred, l2sum, torch.ones_like(l2sum))
-        l2norm = torch.where(pred, l2sum_safe.sqrt(), l2sum)
-        values_clip = tensor * clip_norm / torch.max(l2norm, clip_norm)
-        return values_clip
+        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(args.droprate)
 
     def forward(self, batch):
         uid, seq, pos, neg, nbr, nbr_iid = batch
+        user_indices = uid
+        item_indices = pos
+        neg_item_indices = neg
 
-        user_emb = self.clip_by_norm(self.user_embs(uid.to(self.dev)), clip_norm=1, dim=-1)  # B x d
-        seq_emb = self.clip_by_norm(self.item_embs(seq.to(self.dev)), clip_norm=1, dim=-1)  # B x sl x d
-        pos_emb = self.clip_by_norm(self.item_embs(pos.to(self.dev)), clip_norm=1, dim=-1)
-        neg_emb = self.clip_by_norm(self.item_embs(neg.to(self.dev)), clip_norm=1, dim=-1)
+        item_indices = item_indices.to(self.dev).long()
+        neg_item_indices = neg_item_indices.to(self.dev).long()
+        user_indices = user_indices.to(self.dev).long().unsqueeze(1).expand_as(item_indices)
 
-        user_emb = user_emb.unsqueeze(1).expand_as(seq_emb)  # B x sl x d
-        h_out = user_emb + self.trans + seq_emb
+        user_embedding_mlp = self.embedding_user_mlp(user_indices)
+        pos_item_embedding_mlp = self.embedding_item_mlp(item_indices)
+        neg_item_embedding_mlp = self.embedding_item_mlp(neg_item_indices)
+        user_embedding_mf = self.embedding_user_mf(user_indices)
+        pos_item_embedding_mf = self.embedding_item_mf(item_indices)
+        neg_item_embedding_mf = self.embedding_item_mf(neg_item_indices)
 
-        pos_bias = self.item_beta(pos.to(self.dev))  # B x sl x 1
-        neg_bias = self.item_beta(neg.to(self.dev))  # B x sl x 1
+        pos_mlp_vector = torch.cat([user_embedding_mlp, pos_item_embedding_mlp], dim=-1)
+        pos_mlp_vector = \
+            self.dropout(self.act(self.mlp_lin2(
+            self.dropout(self.act(self.mlp_lin1(
+            self.dropout(self.act(self.mlp_lin0(
+                    pos_mlp_vector)))))))))
 
-        pos_logits = pos_bias - self.l2_distance(h_out, pos_emb)  # B x sl x 1
-        neg_logits = neg_bias - self.l2_distance(h_out, neg_emb)  # B x sl x 1
+        pos_mf_vector = self.dropout(torch.mul(user_embedding_mf, pos_item_embedding_mf))
+        pos_vector = torch.cat([pos_mlp_vector, pos_mf_vector], dim=-1)
+        pos_logits = self.out_lin(pos_vector)
+
+        neg_mlp_vector = torch.cat([user_embedding_mlp, neg_item_embedding_mlp], dim=-1)
+        neg_mlp_vector = \
+            self.dropout(self.act(self.mlp_lin2(
+            self.dropout(self.act(self.mlp_lin1(
+            self.dropout(self.act(self.mlp_lin0(
+                    neg_mlp_vector)))))))))
+
+        neg_mf_vector = self.dropout(torch.mul(user_embedding_mf, neg_item_embedding_mf))
+        neg_vector = torch.cat([neg_mlp_vector, neg_mf_vector], dim=-1)
+        neg_logits = self.out_lin(neg_vector)
 
         return pos_logits, neg_logits
 
@@ -151,20 +166,35 @@ class TransRec(nn.Module):
         all_scores = list()
         self.eval()
         with torch.no_grad():
-            for i, eval_batch in enumerate(eval_loader):
+            for eval_batch in eval_loader:
                 uid, seq, nbr, nbr_iid, eval_iid = eval_batch
-                user_emb = self.user_embs(uid.long().to(self.dev))  # B x d
-                last_emb = self.item_embs(seq[:, -1].long().to(self.dev))  # B x d
-                item_embs = self.item_embs(eval_iid.long().to(self.dev))  # B x item_len x d
-                item_bias = self.item_beta(eval_iid.long().to(self.dev))  # B x item_len x 1
-                h_out = user_emb + self.trans + last_emb
-                h_out = h_out.unsqueeze(1).expand_as(item_embs)
-                batch_score = item_bias - self.l2_distance(h_out, item_embs)
-                all_scores.append(batch_score.squeeze())
+                user_indices = uid
+                item_indices = eval_iid
+
+                item_indices = item_indices.to(self.dev).long()
+                user_indices = user_indices.to(self.dev).long().unsqueeze(1).expand_as(item_indices)
+
+                item_embedding_mlp = self.embedding_item_mlp(item_indices)
+                user_embedding_mlp = self.embedding_user_mlp(user_indices)
+                item_embedding_mf = self.embedding_item_mf(item_indices)
+                user_embedding_mf = self.embedding_user_mf(user_indices)
+
+                mlp_vector = torch.cat([user_embedding_mlp, item_embedding_mlp], dim=-1)
+                mlp_vector = \
+                    self.dropout(self.act(self.mlp_lin2(
+                    self.dropout(self.act(self.mlp_lin1(
+                    self.dropout(self.act(self.mlp_lin0(
+                        mlp_vector)))))))))
+
+                mf_vector = self.dropout(torch.mul(user_embedding_mf, item_embedding_mf))
+                vector = torch.cat([mlp_vector, mf_vector], dim=-1)
+                batch_score = self.out_lin(vector).squeeze()
+                all_scores.append(batch_score)
 
             all_scores = torch.cat(all_scores, dim=0)
 
             return all_scores
+
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -223,9 +253,14 @@ def train(model, opt, shdlr, train_loader, args):
         opt.zero_grad()
         shdlr.step()
         pos_logits, neg_logits = model(parsed_batch)
-        loss = -1.0 * (pos_logits[indices] - neg_logits[indices]).sigmoid().log().mean()
+        if args.loss_type == 'bce':
+            loss = F.binary_cross_entropy_with_logits(pos_logits[indices], torch.ones_like (pos_logits)[indices]) + \
+                   F.binary_cross_entropy_with_logits(neg_logits[indices], torch.zeros_like(neg_logits)[indices])
+        elif args.loss_type == 'bpr':
+            loss = F.softplus(neg_logits[indices] - pos_logits[indices]).mean()
         loss.backward()
         opt.step()
+
         total_loss += loss.item()
 
     return total_loss / len(train_loader)
@@ -310,8 +345,7 @@ def load_ds(args, item_num):
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         shuffle=True,
-        drop_last=False,
-        pin_memory=True)
+        drop_last=False)
 
     val_loader = DataLoader(
         dataset=WechatDataset(data, item_num, args.seq_maxlen, is_train=False, is_test=False),
@@ -335,13 +369,13 @@ def load_ds(args, item_num):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='TransRec')
-    parser.add_argument('--model', default='TransRec')
+    parser = argparse.ArgumentParser(description='NeuMF')
     parser.add_argument('--dataset', default='Yelp')
 
     # Model Config
     parser.add_argument('--edim', type=int, default=64)
     parser.add_argument('--seq_maxlen', type=int, default=50, help='fixed, or change with sampled train_batches')
+    parser.add_argument('--nbr_maxlen', type=int, default=20, help='fixed, or change with sampled train_batches')
 
     # Train Config
     parser.add_argument('--batch_size', type=int, default=1024, help='fixed, or change with sampled train_batches')
@@ -349,10 +383,12 @@ def main():
     parser.add_argument('--lr', type=float, default=0.01)
     parser.add_argument('--lr_gamma', type=float, default=0.001)
     parser.add_argument('--lr_decay_rate', type=float, default=0.75)
-    parser.add_argument('--l2rg', type=float, default=0.0)
+    parser.add_argument('--l2rg', type=float, default=1e-5)
+    parser.add_argument('--emb_reg', type=float, default=0.0)
     parser.add_argument('--device', default='cuda:1')
-    parser.add_argument('--max_epochs', type=int, default=200)
-    parser.add_argument('--check_epoch', type=int, default=5)
+    parser.add_argument('--max_epochs', type=int, default=50)
+    parser.add_argument('--check_epoch', type=int, default=1)
+    parser.add_argument('--loss_type', default='bce', help='bce/bpr')
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--patience', type=int, default=5)
 
@@ -372,8 +408,8 @@ def main():
     print('Loaded Yelp dataset with {} users {} items in {:.2f}s'.format(user_num, item_num, time()-st))
 
     timestr = datetime.now().strftime("%Y%m%d_%Hh%Mm%Ss")
-    model_path = f'saved_models/{args.model}_{args.dataset}_{timestr}.pth'
-    logger = get_logger(os.path.join('logs', f'{args.model}_{args.dataset}_{timestr}.log'))
+    model_path = f'saved_models/NeuMF_{args.dataset}_{timestr}.pth'
+    logger = get_logger(os.path.join('logs', f'NeuMF_{args.dataset}_{timestr}.log'))
     logger.info(args)
     device = torch.device(args.device)
 
@@ -384,9 +420,9 @@ def main():
         torch.cuda.manual_seed_all(seed)
         np.random.seed(seed)
 
-        model = TransRec(user_num, item_num, args)
+        model = NeuMF(user_num, item_num, args)
         model = model.to(device)
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2rg)
         lr_scheduler = StepwiseLR(opt, init_lr=args.lr, gamma=args.lr_gamma, decay_rate=args.lr_decay_rate)
         best_score = patience_cnt = 0
 
@@ -432,7 +468,6 @@ def main():
     logger.info('Std  hr5={:.4f}, hr10={:.4f}, hr20={:.4f}, ndcg5={:.4f}, ndcg10={:.4f}, ndcg20={:.4f}'.format(
         stds[0], stds[1], stds[2], stds[3], stds[4], stds[5]))
     logger.info("Done")
-
 
 if __name__ == '__main__':
     main()

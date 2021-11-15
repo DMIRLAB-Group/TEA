@@ -22,6 +22,9 @@ from scipy.io import loadmat
 from time import time
 import torch.multiprocessing
 import joblib
+torch.multiprocessing.set_sharing_strategy('file_system')
+np.set_printoptions(threshold=1000000)
+
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Helpers
@@ -108,12 +111,12 @@ class FFN(torch.nn.Module):
         return outputs
 
 
-class CRFGNN(nn.Module):
+class SAS(nn.Module):
     def __init__(self,
                  user_num,
                  item_num,
                  args):
-        super(CRFGNN, self).__init__()
+        super(SAS, self).__init__()
         self.user_num = user_num
         self.item_num = item_num
         edim = args.edim
@@ -129,34 +132,28 @@ class CRFGNN(nn.Module):
         self.item_ffn_layernorm = nn.LayerNorm(edim, eps=1e-8)
         self.item_ffn = FFN(edim, args.droprate)
         self.item_last_layernorm = nn.LayerNorm(edim, eps=1e-8)
-        self.seq_lin = nn.Linear(edim + edim, edim)
-
-        # LSTM Block, encode user neighbors hist item
-        self.rnn = nn.GRU(input_size=edim, hidden_size=edim, num_layers=1, batch_first=True)
-
-        # Fuse Layer
-        self.nbr_item_fsue_lin = nn.Linear(edim + edim, edim)
-        self.nbr_ffn_layernom = nn.LayerNorm(edim, eps=1e-8)
-        self.nbr_ffn = FFN(edim, args.droprate)
-        self.nbr_last_layernorm = nn.LayerNorm(edim, eps=1e-8)
 
         # Embedding Layer
         self.user_embs = nn.Embedding(user_num, edim, padding_idx=0)
         self.item_embs = nn.Embedding(item_num, edim, padding_idx=0)
-        self.posn_embs = nn.Embedding(args.seq_maxlen, edim, padding_idx=0)
-        nn.init.uniform_(self.user_embs.weight[1:], a=-0.5/user_num, b=0.5/user_num)
-        nn.init.uniform_(self.item_embs.weight[1:], a=-0.5/item_num, b=0.5/item_num)
-        nn.init.uniform_(self.posn_embs.weight[1:], a=-0.5/args.seq_maxlen, b=0.5/args.seq_maxlen)
+        nn.init.normal_(self.user_embs.weight, std=0.01)
+        nn.init.normal_(self.item_embs.weight, std=0.01)
+
+        if args.use_pos_emb:
+            self.posn_embs = nn.Embedding(args.seq_maxlen, edim, padding_idx=0)
+            nn.init.normal_(self.posn_embs.weight, std=0.01)
 
         self.act = nn.ReLU()
         self.dropout = nn.Dropout(args.droprate)
 
-    def seq2feat(self, seq_iid):
+    def seq2feat(self, seq_iid, pert=None):
         timeline_mask = torch.BoolTensor(seq_iid == 0).to(self.dev)  # mask the padding item
         seqs = self.item_embs(seq_iid.to(self.dev)) * (self.item_embs.embedding_dim ** 0.5)  # Rescale emb
         if self.args.use_pos_emb:
             positions = np.tile(np.array(range(seq_iid.shape[1]), dtype=np.int64), [seq_iid.shape[0], 1])
             seqs += self.posn_embs(torch.LongTensor(positions).to(self.dev))
+        if pert is not None:
+            seqs += pert
 
         seqs = self.dropout(seqs)
 
@@ -176,98 +173,22 @@ class CRFGNN(nn.Module):
 
         return seqs
 
-    def nbr2feat(self, uid, nbr, nbr_iid):
+    def pred(self, hu, hi):
+        return (hu * hi).sum(dim=-1)
 
-        # Get mask and neighbors length
-        batch_size, nbr_maxlen, seq_maxlen = nbr_iid.shape
-        nbr_mask = torch.BoolTensor(nbr == 0).to(self.dev)  # B x nl
-        nbr_seq_mask = torch.BoolTensor(nbr_iid == 0).to(self.dev)  # B x nl x sl
-        nbr_len = (nbr_maxlen - nbr_mask.sum(1))  # B
-        nbr_len[torch.where(nbr_len == 0)] = 1.0  # to avoid deivide by zero
-
-        # Get embs
-        # uid = uid.to(self.dev).unsqueeze(-1)  # B x 1
-        nbr = nbr.to(self.dev)  # B x nl
-        nbr_iid = nbr_iid.to(self.dev)  # B x nl x sl
-        # user_emb = self.dropout(self.user_embs(uid))  # B x  1 x d
-        nbr_emb = self.dropout(self.user_embs(nbr))  # B x nl x d
-        nbr_item_emb = self.dropout(self.item_embs(nbr_iid))  # B x nl x sl x d
-
-        # Static Social Network Features
-        nbr_emb *= ~nbr_mask.unsqueeze(-1)  # B x nl x d
-        nbr_len = nbr_len.view(batch_size, 1, 1)  # B x 1 x 1
-        nbr_feat = nbr_emb.sum(dim=1, keepdim=True) / nbr_len  # B x 1 x d
-
-        # Temporal Neighbor-Items Features
-        nbr_seq_mask = nbr_seq_mask.unsqueeze(-1)  # B x nl x sl x 1
-        nbr_seq_mask = nbr_seq_mask.permute(0, 2, 1, 3)  # B x sl x nl x 1
-        nbr_item_emb = nbr_item_emb.permute(0, 2, 1, 3)  # B x sl x nl x d
-        nbr_item_emb *= ~nbr_seq_mask  # B x sl x nl x d
-        nbr_seq_len = (seq_maxlen - nbr_seq_mask.sum(dim=2))  # B x sl x 1
-        nbr_seq_len[torch.where(nbr_seq_len == 0)] = 1.0  # to avoid deivide by zero
-        nbr_seq_feat = nbr_item_emb.sum(dim=2) / nbr_seq_len  # B x sl x d
-        nbr_seq_feat, _ = self.rnn(nbr_seq_feat)  # B x sl x d
-
-        nbr_feat = nbr_feat.expand_as(nbr_seq_feat)
-        nbr_feat = self.nbr_item_fsue_lin(torch.cat([nbr_feat, nbr_seq_feat], dim=-1))
-        nbr_feat = self.nbr_ffn_layernom(nbr_feat)
-        nbr_feat = self.nbr_ffn(nbr_feat)
-        nbr_feat = self.nbr_last_layernorm(nbr_feat)
-
-        return nbr_feat
-
-    def dual_pred(self, seq_hu, nbr_hu, hi):
-        seq_logits = (seq_hu * hi).sum(dim=-1)
-        nbr_logits = (nbr_hu * hi).sum(dim=-1)
-        return seq_logits + nbr_logits
-
-    def dual_forward(self, batch):
+    def forward(self, batch, pert=None):
         uid, seq, pos, neg, nbr, nbr_iid = batch
-
-        uid = uid.unsqueeze(1).expand_as(seq)
-        user_emb = self.dropout(self.user_embs(uid.to(self.dev)))
-
-        # Encode user behavior sequence
-        seq_feat = self.seq2feat(seq)  # B x sl x d
-        seq_feat = self.seq_lin(torch.cat([seq_feat, user_emb], dim=-1))
-
-        # Propagate user intent to his neighbors through time
-        nbr_feat = self.nbr2feat(uid, nbr, nbr_iid)  # B x sl x d
-
+        hu = self.seq2feat(seq, pert)  # B x sl x d
         pos_hi = self.dropout(self.item_embs(pos.to(self.dev)))
         neg_hi = self.dropout(self.item_embs(neg.to(self.dev)))
+        if pert is not None:
+            pos_logits = self.pred(hu, pos_hi + pert)
+            neg_logits = self.pred(hu, neg_hi + pert)
+        else:
+            pos_logits = self.pred(hu, pos_hi)
+            neg_logits = self.pred(hu, neg_hi)
 
-        pos_logits = self.dual_pred(seq_feat, nbr_feat, pos_hi)  # B x sl
-        pos_logits = pos_logits.unsqueeze(-1)                    # B x sl x 1
-
-        seq_feat = seq_feat.unsqueeze(-2).expand_as(neg_hi)      # B x sl x ns x d
-        nbr_feat = nbr_feat.unsqueeze(-2).expand_as(neg_hi)      # B x sl x ns x d
-        neg_logits = self.dual_pred(seq_feat, nbr_feat, neg_hi)  # B x sl x ns
-
-        return pos_logits, neg_logits, user_emb, pos_hi, neg_hi
-
-    def get_parameters(self):
-        param_list = [
-            {'params': self.item_attn_layernorm.parameters()},
-            {'params': self.item_attn_layer.parameters()},
-            {'params': self.item_ffn_layernorm.parameters()},
-            {'params': self.item_ffn.parameters()},
-            {'params': self.item_last_layernorm.parameters()},
-
-            {'params':  self.nbr_item_fsue_lin.parameters()},
-            {'params': self.nbr_ffn_layernom.parameters()},
-            {'params': self.nbr_ffn.parameters()},
-            {'params': self.nbr_last_layernorm.parameters()},
-            {'params': self.rnn.parameters()},
-
-            {'params': self.seq_lin.parameters()},
-
-            {'params': self.user_embs.parameters(), 'weight_decay': 0},
-            {'params': self.item_embs.parameters(), 'weight_decay': 0},
-            {'params': self.posn_embs.parameters(), 'weight_decay': 0},
-        ]
-
-        return param_list
+        return pos_logits, neg_logits
 
     def eval_all_users(self, eval_loader):
         all_scores = list()
@@ -275,19 +196,13 @@ class CRFGNN(nn.Module):
         with torch.no_grad():
             for i, eval_batch in enumerate(eval_loader):
                 uid, seq, nbr, nbr_iid, eval_iid = eval_batch
-                uid = uid.long()
                 seq = seq.long()
-                nbr = nbr.long()
-                nbr_iid = nbr_iid.long()
                 eval_iid = eval_iid.long()
                 hi = self.item_embs(eval_iid.to(self.dev))  # B x item_len x d
-                seq_feat = self.seq2feat(seq)[:, -1, :]
-                user_emb = self.user_embs(uid.to(self.dev))
-                seq_feat = self.seq_lin(torch.cat([seq_feat, user_emb], dim=-1))
-                nbr_feat = self.nbr2feat(uid, nbr, nbr_iid)[:, -1, :]
-                seq_feat = seq_feat.unsqueeze(1).expand_as(hi)
-                nbr_feat = nbr_feat.unsqueeze(1).expand_as(hi)
-                batch_score = self.dual_pred(seq_feat, nbr_feat, hi)  # B x item_len
+                hu = self.seq2feat(seq)[:, -1, :]
+                hu = hu.unsqueeze(1).expand_as(hi)
+
+                batch_score = self.pred(hu, hi)  # B x item_len
                 all_scores.append(batch_score)
 
             all_scores = torch.cat(all_scores, dim=0)
@@ -298,7 +213,7 @@ class CRFGNN(nn.Module):
 # ---------------------------------------------------------------------------------------------------------------------
 # Train and Evaluate
 
-def parse_sampled_batch(batch):
+def parse_sampled_batch(batch, args):
     uid, seq, pos, neg, nbr, nbr_iid = batch
     uid = uid.long()
     seq = seq.long()
@@ -308,7 +223,14 @@ def parse_sampled_batch(batch):
     nbr_iid = nbr_iid.long()
     batch = [uid, seq, pos, neg, nbr, nbr_iid]
     indices = torch.where(pos != 0)
-    return batch, indices
+
+    pert = torch.normal(mean=0.0,
+                        std=args.pert_eps,
+                        size=(len(seq), args.seq_maxlen, args.edim),
+                        requires_grad=True,
+                        device=torch.device(args.device))
+
+    return batch, indices, pert
 
 
 def evaluate(model, eval_loader, eval_users):
@@ -343,47 +265,51 @@ def evaluate(model, eval_loader, eval_users):
     return hr5, hr10, hr20, ndcg5, ndcg10, ndcg20
 
 
-def train(model, opt, shdlr, train_loader, num_item, args):
+def train(model, opt, shdlr, train_loader, args):
     model.train()
     total_loss = 0.0
     for batch in train_loader:
-        parsed_batch, indices = parse_sampled_batch(batch)
+        parsed_batch, indices, pert = parse_sampled_batch(batch, args)
+        # print('pert =', pert.shape)
+
+        # Clac pert_adv via BP
         opt.zero_grad()
-        pos_logits, neg_logits, user_emb, pos_hi, neg_hi = model.dual_forward(parsed_batch)
+        pos_logits, neg_logits = model(parsed_batch, pert)
+        pert_loss = F.binary_cross_entropy_with_logits(pos_logits[indices], torch.ones_like(pos_logits)[indices]) + \
+               F.binary_cross_entropy_with_logits(neg_logits[indices], torch.zeros_like(neg_logits)[indices])
+        pert_loss.backward()
 
-        loss = 0.0
-        if args.loss_type == 'bce':
-            loss += F.binary_cross_entropy_with_logits(pos_logits[indices], torch.ones_like(pos_logits)[indices]) + \
-                    F.binary_cross_entropy_with_logits(neg_logits[indices], torch.zeros_like(neg_logits)[indices])
-        elif args.loss_type == 'bpr':
-            loss += F.softplus(neg_logits[indices] - pos_logits[indices]).mean()
-        elif args.loss_type == 'sfm':
-            uid, seq, pos, neg, nbr, nbr_iid = parsed_batch
-            all_items = torch.cat([pos.unsqueeze(-1), neg], dim=-1)  # B x sl x (1 + ns)
-            all_indices = torch.where(all_items != 0)
-            logits = torch.cat([pos_logits, neg_logits], dim=-1)  # B x sl x (1 + ns)
-            logits = logits[all_indices].view(-1, 1 + args.neg_size)
-            device = torch.device(f'{args.device}')
-            labels = torch.zeros((logits.shape[0])).long().to(device)
-            loss += F.cross_entropy(logits, labels)
+        pert_grad = pert.grad
+        # print('pert_grad =', pert_grad.shape, pert_grad.norm(2, dim=-1, keepdim=True).mean())
+        pert_adv = args.pert_eps * pert_grad / (1e-9 + pert_grad.norm(2, dim=-1, keepdim=True))
+        # print('pert_adv =', pert_adv.shape, pert_adv.norm(2))
 
-        # Embedding Reg loss
-        user_norm = user_emb.norm(2, dim=-1).pow(2).mean()
-        item_norm = pos_hi.norm(2, dim=-1).pow(2).mean() + neg_hi.norm(2, dim=-1).pow(2).mean()
-        emb_reg_loss = args.emb_reg * 0.5 * (user_norm + item_norm)
-        loss += emb_reg_loss
+        # Training with pert_adv perturbation on item embeddings
+        opt.zero_grad()
 
+        # Pure samples
+        pos_logits, neg_logits = model(parsed_batch)
+        loss = F.binary_cross_entropy_with_logits(pos_logits[indices], torch.ones_like (pos_logits)[indices]) + \
+               F.binary_cross_entropy_with_logits(neg_logits[indices], torch.zeros_like(neg_logits)[indices])
+
+        # Adv perturbated samples
+        pos_logits, neg_logits = model(parsed_batch, pert_adv)
+        adv_loss = F.binary_cross_entropy_with_logits(pos_logits[indices], torch.ones_like (pos_logits)[indices]) + \
+                   F.binary_cross_entropy_with_logits(neg_logits[indices], torch.zeros_like(neg_logits)[indices])
+
+        # print('pert_loss={:.4f} adv_loss={:.4f} pure=loss={:.4f}'.format(pert_loss.item(), adv_loss.item(), loss.item()))
+
+        loss = loss + args.pert_lambda * adv_loss
         loss.backward()
         opt.step()
         shdlr.step()
-
         total_loss += loss.item()
 
     return total_loss / len(train_loader)
 
 
 class WechatDataset(Dataset):
-    def __init__(self, data, item_num, seq_maxlen, neg_size, is_train, is_test):
+    def __init__(self, data, item_num, seq_maxlen, is_train, is_test):
         self.uid = data['train_uid']
         self.seq = data['train_seq']
         self.pos = data['train_pos']
@@ -398,7 +324,6 @@ class WechatDataset(Dataset):
 
         self.item_num = item_num
         self.seq_maxlen = seq_maxlen
-        self.neg_size = neg_size
         self.is_train = is_train
         self.is_test = is_test
 
@@ -418,7 +343,7 @@ class WechatDataset(Dataset):
             eval_iids = self.get_neg_samples(user, seq)
             return user, seq, nbr, nbr_iid, eval_iids
 
-    def get_neg_samples_v0(self, user, seq):
+    def get_neg_samples(self, user, seq):
         if self.is_train:
             neg_sample_size = len(np.nonzero(seq)[0])
             if neg_sample_size == 0:  # user_train[user]只有一个item，并在pos中用作next item
@@ -453,61 +378,27 @@ class WechatDataset(Dataset):
 
         return samples
 
-    def get_neg_samples(self, user, seq):
-
-        if self.is_train:
-            neg = np.random.randint(low=1, high=self.item_num, size=(self.seq_maxlen, self.neg_size))
-            neg = torch.from_numpy(neg).long()
-            seq = torch.from_numpy(seq).long()
-            pos_mask = seq.unsqueeze(-1).clone()
-            pos_mask[seq != 0] = 1
-            neg *= pos_mask
-            return neg
-
-        else:
-            neg_sample_size = 100
-            if user not in self.eval_users:
-                return np.zeros((neg_sample_size), dtype=np.int64)
-            else:
-                if self.is_test: eval_iid = self.user_test[user][0]
-                else: eval_iid = self.user_valid[user][0]
-                neg_list = [eval_iid]
-
-            rated_set = set(self.user_train[user][:, 0].tolist())
-            if len(self.user_valid[user]): rated_set.add(self.user_valid[user][0])
-            if len(self.user_test[user]): rated_set.add(self.user_test[user][0])
-            rated_set.add(0)
-
-            while len(neg_list) < neg_sample_size:
-                neg = np.random.randint(low=1, high=self.item_num)
-                while neg in rated_set:
-                    neg = np.random.randint(low=1, high=self.item_num)
-                neg_list.append(neg)
-
-            samples = np.array(neg_list, dtype=np.int64)
-
-            return samples
-
 
 def load_ds(args, item_num):
     data = np.load(f'datasets/{args.dataset}/processed_data.npz', allow_pickle=True)
 
     train_loader = DataLoader(
-        dataset=WechatDataset(data, item_num, args.seq_maxlen, args.neg_size, is_train=True, is_test=False),
+        dataset=WechatDataset(data, item_num, args.seq_maxlen, is_train=True, is_test=False),
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         shuffle=True,
-        drop_last=False)
+        drop_last=False,
+        pin_memory=True)
 
     val_loader = DataLoader(
-        dataset=WechatDataset(data, item_num, args.seq_maxlen, args.neg_size, is_train=False, is_test=False),
+        dataset=WechatDataset(data, item_num, args.seq_maxlen, is_train=False, is_test=False),
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         shuffle=False,
         drop_last=False)
 
     test_loader = DataLoader(
-        dataset=WechatDataset(data, item_num, args.seq_maxlen, args.neg_size, is_train=False, is_test=True),
+        dataset=WechatDataset(data, item_num, args.seq_maxlen, is_train=False, is_test=True),
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         shuffle=False,
@@ -521,16 +412,17 @@ def load_ds(args, item_num):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='TEA-Gsage')
+    parser = argparse.ArgumentParser(description='ASASRec')
+    parser.add_argument('--model', default='ASASRec')
     parser.add_argument('--dataset', default='Yelp')
-    parser.add_argument('--model', default='TEA_Gsage')
 
     # Model Config
     parser.add_argument('--edim', type=int, default=64)
     parser.add_argument('--use_pos_emb', type=int, default=True)
+    parser.add_argument('--pert_eps', type=float, default=1e-2)
+    parser.add_argument('--pert_lambda', type=float, default=1.0)
     parser.add_argument('--seq_maxlen', type=int, default=50, help='fixed, or change with sampled train_batches')
     parser.add_argument('--nbr_maxlen', type=int, default=20, help='fixed, or change with sampled train_batches')
-    parser.add_argument('--neg_size', type=int, default=50, help='Negative samples number')
 
     # Train Config
     parser.add_argument('--batch_size', type=int, default=1024, help='fixed, or change with sampled train_batches')
@@ -538,18 +430,17 @@ def main():
     parser.add_argument('--lr', type=float, default=0.01)
     parser.add_argument('--lr_gamma', type=float, default=0.001)
     parser.add_argument('--lr_decay_rate', type=float, default=0.75)
-    parser.add_argument('--l2rg', type=float, default=5e-4)
-    parser.add_argument('--emb_reg', type=float, default=5e-4)
+    parser.add_argument('--l2rg', type=float, default=1e-4)
+    parser.add_argument('--emb_reg', type=float, default=0.0)
     parser.add_argument('--device', default='cuda:0')
-    parser.add_argument('--max_epochs', type=int, default=500)
-    parser.add_argument('--check_epoch', type=int, default=5)
-    parser.add_argument('--start_epoch', type=int, default=20)
-    parser.add_argument('--loss_type', default='sfm', help='bce/bpr/sfm')
+    parser.add_argument('--max_epochs', type=int, default=40)
+    parser.add_argument('--check_epoch', type=int, default=1)
+    parser.add_argument('--loss_type', default='bce', help='bce/bpr')
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--patience', type=int, default=5)
 
     # Something else
-    parser.add_argument('--repeat', type=int, default=1)
+    parser.add_argument('--repeat', type=int, default=5)
     parser.add_argument('--test_time', type=int, default=1)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--verbose', type=int, default=False)
@@ -561,8 +452,9 @@ def main():
     print('Loading...')
     st = time()
     train_loader, val_loader, test_loader, user_train, eval_users = load_ds(args, item_num)
-    print('Loaded {} dataset with {} users {} items in {:.2f}s'.format(args.dataset, user_num, item_num, time()-st))
-    timestr = datetime.now().strftime("%Y%m%d_%Hh%Mm%Ss")  # best_model_id_timestr = '20210123_19h39m22s'
+    print('Loaded Yelp dataset with {} users {} items in {:.2f}s'.format(user_num, item_num, time()-st))
+
+    timestr = datetime.now().strftime("%Y%m%d_%Hh%Mm%Ss")
     model_path = f'saved_models/{args.model}_{args.dataset}_{timestr}.pth'
     logger = get_logger(os.path.join('logs', f'{args.model}_{args.dataset}_{timestr}.log'))
     logger.info(args)
@@ -575,18 +467,19 @@ def main():
         torch.cuda.manual_seed_all(seed)
         np.random.seed(seed)
 
-        model = CRFGNN(user_num, item_num, args)
+        model = SAS(user_num, item_num, args)
         model = model.to(device)
-        opt = torch.optim.Adam(model.get_parameters(), lr=args.lr, weight_decay=args.l2rg)
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2rg)
         lr_scheduler = StepwiseLR(opt, init_lr=args.lr, gamma=args.lr_gamma, decay_rate=args.lr_decay_rate)
         best_score = patience_cnt = 0
+
         for epoch in range(1, args.max_epochs):
             st = time()
-            train_loss = train(model, opt, lr_scheduler, train_loader, item_num, args)
+            train_loss = train(model, opt, lr_scheduler, train_loader, args)
             print('Epoch:{} Train Loss={:.4f} Time={:.2f}s LR={:.8f}'.format(
                 epoch, train_loss, time()-st, lr_scheduler.get_lr()))
 
-            if epoch % args.check_epoch == 0 and epoch >= args.start_epoch:
+            if epoch % args.check_epoch == 0 and epoch >= 0:
                 val_metrics = evaluate(model, val_loader, eval_users)
                 hr5, hr10, hr20, ndcg5, ndcg10, ndcg20 = val_metrics
                 logger.info(
@@ -595,7 +488,7 @@ def main():
 
                 if best_score < hr10:
                     torch.save(model.state_dict(), model_path)
-                    print('Validation HitRate@10 increased: {:.4f} --> {:.4f}'.format(best_score, hr10))
+                    print('Validation score increased: {:.4f} --> {:.4f}'.format(best_score, hr10))
                     best_score = hr10
                     patience_cnt = 0
                 else:
@@ -605,7 +498,7 @@ def main():
                     print('Early Stop!!!')
                     break
 
-        print('Testing')
+        print('Testing', end='')
         model.load_state_dict(torch.load(model_path))
         test_metrics = evaluate(model, test_loader, eval_users)
         hr5, hr10, hr20, ndcg5, ndcg10, ndcg20 = test_metrics
@@ -616,7 +509,7 @@ def main():
     metrics = np.array(metrics_list)
     means = metrics.mean(axis=0)
     stds = metrics.std(axis=0)
-    print(f'{args.model} {args.dataset} Test Summary:')
+    print('Test Summary:')
     logger.info('Mean hr5={:.4f}, hr10={:.4f}, hr20={:.4f}, ndcg5={:.4f}, ndcg10={:.4f}, ndcg20={:.4f}'.format(
         means[0], means[1], means[2], means[3], means[4], means[5]))
     logger.info('Std  hr5={:.4f}, hr10={:.4f}, hr20={:.4f}, ndcg5={:.4f}, ndcg10={:.4f}, ndcg20={:.4f}'.format(
