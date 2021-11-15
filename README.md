@@ -19,5 +19,5 @@ The training method of the baseline in the paper is similar
 ## Experiment Result  
 ### Epinions  
 ![image](Epinions_res.png)  
-## #Yelp
+### Yelp
 ![image](Yelp_res.png)
