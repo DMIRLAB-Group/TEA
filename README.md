@@ -4,9 +4,6 @@ python 3.6
 torch 1.9  
 numpy 1.19
 
-##  Compute environment
-GPU:V100
-
 ## Quick Start  
 The experiment uses the Yelp and Epinions data sets. Data preprocessing is required before training.  Here uses yelp as an example
 ```
